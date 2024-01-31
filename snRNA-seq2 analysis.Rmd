@@ -1,0 +1,1080 @@
+---
+title: "snRNA-seq2 analysis"
+author: "liwei"
+date: "`r Sys.Date()`"
+output: html_document
+---
+# system setting
+
+To avoid the incompatiablity between Seurat V4 and V5,  
+
+options(Seurat.object.assay.version = 'v4') need to be run.
+
+```{r,R enviroment activiation,include=FALSE}
+renv::activate(project = "~/my_SCP_env")
+```
+
+```{r,library,include=FALSE}
+library(Seurat)
+library(Matrix)
+library(Signac)
+library(dplyr)
+library(hdf5r)
+library(EnsDb.Mmusculus.v79)
+library(AnnotationHub)
+library(SCP)
+library(future)
+library(future.apply)
+library(ggplot2)
+library(harmony)
+library(UCell)
+library(SCpubr)
+library(org.Mm.eg.db)
+library(gprofiler2)
+library(rtracklayer)
+library(sceasy)
+library(AnnotationHub)
+library(DGEobj.utils)
+```
+
+```{r,set the working path,include=FALSE}
+knitr::opts_knit$set(root.dir = "user/path")
+
+setwd(dir = "user/path")
+
+options(Seurat.object.assay.version = 'v4')#### very important!!!!!!
+```
+
+```{r,multicore setting,include=FALSE}
+nbrOfWorkers()
+plan(multisession, workers=16)
+nbrOfWorkers()
+```
+
+
+
+
+# Create the seu obj and preprossing
+
+## load the combined count matrix from htseq
+```{r,include=FALSE}
+# load the combined count matrix
+
+count.file.path<-"htseq_gene_counts_20231031.tsv"
+
+raw.count <- read.table(count.file.path,header =T)
+
+rownames(raw.count)<-raw.count$gene
+
+raw.count<-raw.count[,-which(colnames(raw.count)=="gene")]
+
+save(raw.count,file = "raw count with gene id.RData")
+```
+
+## load and extract the GTF file
+
+```{r,include=FALSE}
+# load the  genome annotation including ERCC infomation
+GTF.file.path <-"mmGRCm38.93.ERCC92.gtf"
+
+# Import the GTF file
+gtf.data <- rtracklayer::import(GTF.file.path)
+
+# get metedate from gtf
+
+gtf.data<-gtf.data@elementMetadata@listData
+
+gtf.data<-as.data.frame(t(do.call(rbind,gtf.data)))
+
+gtf.data<-gtf.data %>%
+  distinct(gene_id, .keep_all = TRUE)
+
+# extract the gene id from count matrix
+
+raw.id<-rownames(raw.count)
+
+# extract the gene id from gtf metadata
+
+gtf.id<-gtf.data$gene_id
+
+# check the legnth of gtf.id and raw.id
+
+length(raw.id)
+
+length(gtf.id)
+
+# check whether gtf.id contain ERCC
+
+summary(grepl("ERCC",raw.id))
+
+summary(grepl("ERCC",gtf.id))
+
+# extract ERCC id
+
+raw.ERCC<-raw.id[grepl("ERCC",raw.id)]
+
+gtf.ERCC<-gtf.id[grepl("ERCC",gtf.id)]
+
+# check whether gtf.ERCC contain all raw.ERCC
+
+length(gtf.ERCC[which(raw.ERCC %in% gtf.ERCC)]) # all in gtf ERCC
+
+# extract from gtf.data and make a gene metadata dataframe
+
+count.gtf<-gtf.data[which(raw.id %in% gtf.id ),
+                    c("gene_id",
+                      "gene_name",
+                      "gene_source",
+                      "gene_biotype" 
+                       )
+                    ]
+
+rownames(count.gtf)<-count.gtf$gene_id
+
+write.csv(count.gtf,file = "Gene Metadata(all).csv",col.names = T,row.names = T)
+
+
+```
+
+## TPM normalization for raw count
+```{r,get gene length,include=FALSE}
+library(GenomicFeatures)
+txdb <- makeTxDbFromGFF("mmGRCm38.93.ERCC92.gtf",format="gtf")
+exons.list.per.gene <- exonsBy(txdb, by = "gene")
+
+#Avoid double counting of overlapping areas with the reduce function
+exonic.gene.sizes <- lapply(exons.list.per.gene,
+                            function(x){sum(width(reduce(x)))})
+#生成的geneID为ensemble编号
+eff_length <- do.call(rbind,lapply(exonic.gene.sizes, data.frame))
+eff_length <- data.frame(gene_id = rownames(eff_length),effLen = eff_length[,1])
+rownames(eff_length)<-eff_length$gene_id 
+rownames(eff_length) <- do.call(rbind,strsplit(as.character(eff_length$gene_id),'\\.'))[,1]
+head(eff_length)
+save(eff_length,file = "gene length with gene id.RData")
+```
+
+```{r,TPM normalization for the count with gene id,include=FALSE}
+identical(rownames(raw.count),rownames(eff_length))# check the length
+
+gene.id.length<-eff_length$effLen/1000
+tpm.count.id<-raw.count
+
+
+# Divide each length by 1000 to get number of kilobases
+# Scale each transcript by the total library size (Total Number of Reads)
+expPKM <- apply( tpm.count.id, 2, function(x) { x / sum(x) * 1E6} )
+
+# Divide by the transcript length
+tpm.count.id<- apply(expPKM, 2, function(x){ x / gene.id.length })
+tpm.count.id[1:5, 1:5]
+
+
+save(tpm.count.id,file = "TPM count with gene id.RData")
+```
+
+
+## Convert gene ID to gene name
+
+```{r,Convert gene ID to gene name,include=FALSE}
+# Aggregate Duplicated Genes
+
+# Here are 98 gene ID with replicate gene name, so aggregate each duplicate gene
+
+tpm.count.id<-as.data.frame(tpm.count.id)
+
+tpm.count.sym <- tpm.count.id  %>%
+             group_by(count.gtf$gene_name) %>% # Convert transcript ID to gene name
+             summarise_all(sum) # Aggregate Duplicated Genes
+
+tpm.count.sym <- as.data.frame(tpm.count.sym)
+
+rownames(tpm.count.sym) <- tpm.count.sym$`count.gtf$gene_name`
+
+
+
+tpm.count.sym<-tpm.count.sym[,-which(colnames(tpm.count.sym)=="count.gtf$gene_name")]
+
+dim(tpm.count.sym)
+
+dim(tpm.count.id)
+
+tpm.count.sym <- as.data.frame(tpm.count.sym)
+
+save(tpm.count.sym,file = "TPM counts with ERCC(gene symbol)-20231031.RData")
+
+```
+
+## Calculate the percentage of ERCC per cell
+
+```{r}
+# Important: use raw count to calculate the percentage of ERCC
+
+# List of ERCC spike-in gene IDs
+ercc_genes <- rownames(raw.count)[grepl("ERCC",rownames(raw.count))] # replace with your ERCC gene IDs
+
+# Subset matrix to get only ERCC counts
+ercc_counts <- raw.count[rownames(raw.count) %in% ercc_genes, ]
+
+# Sum ERCC counts for each cell
+sum_ercc_per_cell <- colSums(ercc_counts)
+
+# Sum total counts for each cell
+sum_total_per_cell <- colSums(raw.count)
+
+# Calculate percentage of ERCC for each cell
+percentage.ercc <- (sum_ercc_per_cell / sum_total_per_cell)*100
+```
+
+## Remove the ERCC from count matrix
+
+```{r,include=FALSE}
+ercc.genes.sym<-count.gtf$gene_name[which(count.gtf$gene_id %in% ercc_genes)]
+
+dim(tpm.count.sym)
+
+tpm.count.sym<-tpm.count.sym[-which(rownames(tpm.count.sym) %in% ercc.genes.sym),]
+
+dim(tpm.count.sym)
+
+tpm.count.sym<-as.matrix(tpm.count.sym)
+
+save(tpm.count.sym,file = "TPM counts without ERCC(gene symbol)-20231031.RData")
+
+```
+
+## create the seu obj and caculate the QC parameter
+
+```{r,include=FALSE}
+raw.data <- CreateSeuratObject(counts = tpm.count.sym,min.cells = 1,min.features = 1)
+
+# load metadata
+
+meta.tab<-read.csv(file = "Metadata rebuttal.csv",
+                   header = T)
+
+rownames(meta.tab)<-meta.tab$LibraryID
+
+# filter the cell which only exist in count matrix
+
+cell.exist<-colnames(tpm.count.sym)
+
+meta.tab<-meta.tab[which(meta.tab$LibraryID %in% cell.exist),]
+
+# add meta data for Seurat
+
+raw.data<-AddMetaData(raw.data,meta.tab)
+
+
+# calculate the ERCC percentage
+
+raw.data[["percent.ERCC"]] <-percentage.ercc
+
+
+# calculate the feature number of  all transcipts- nGene
+
+raw.data$nGene<-raw.data$nFeature_RNA
+
+# calculate the feature number of  all transcipts- nCount
+
+raw.data$nCounts<-raw.data$nCount_RNA
+
+
+# Complexity_all
+
+raw.data$Complexity<-raw.data$nGene/raw.data$nCounts
+
+raw.data$Complexity[is.na(raw.data$Complexity)]<-0
+
+
+# factor the ploidy
+ raw.data$Ploidy<-factor(raw.data$Condition,levels = c("diplo_2n","tetra_2n","tetra_4n"))
+ 
+# create the Timepoint
+raw.data$Timepoint<-raw.data$Age
+
+raw.data$Age[which(raw.data$Timepoint=="20 months"|raw.data$Timepoint== "22 months")]<-"Old"
+
+raw.data$Age[which(raw.data$Timepoint== "4 months" |raw.data$Timepoint=="5 months")]<-"Young"
+
+raw.data$Age<-factor(raw.data$Age,levels = c("Young","Old"))
+
+# Make a intersection between ploidy and Age
+
+raw.data$Group<-0
+
+raw.data$Group[which(raw.data$Ploidy=="diplo_2n" & raw.data$Age=="Young")]<-"Y_dip_2n"
+
+raw.data$Group[which(raw.data$Ploidy=="diplo_2n" & raw.data$Age=="Old")]<-"O_dip_2n"
+
+raw.data$Group[which(raw.data$Ploidy=="tetra_2n" & raw.data$Age=="Young")]<-"Y_tet_2n"
+
+raw.data$Group[which(raw.data$Ploidy=="tetra_2n" & raw.data$Age=="Old")]<-"O_tet_2n"
+
+raw.data$Group[which(raw.data$Ploidy=="tetra_4n" & raw.data$Age=="Young")]<-"Y_tet_4n"
+
+raw.data$Group[which(raw.data$Ploidy=="tetra_4n" & raw.data$Age=="Old")]<-"O_tet_4n"
+
+raw.data$Group<-factor(raw.data$Group,levels = c("Y_dip_2n",
+                                                 "Y_tet_2n",
+                                                 "Y_tet_4n",
+                                                 "O_dip_2n",
+                                                 "O_tet_2n",
+                                                 "O_tet_4n"))
+save(raw.data,file = "raw seu-20231031.RData")
+```
+
+# QC plot before filter
+```{r,include=FALSE}
+plot.var<-colnames(raw.data@meta.data)[15:18]
+
+pdf(file = "QC/QC before filter-)-20231031.pdf",width = 8,height = 4)
+
+for (i in 1:length(plot.var)) {
+ print(plot.var[i])
+  p<- FeatureStatPlot(raw.data, stat.by = plot.var[i], group.by = "Group",
+                      add_box = TRUE,palette = "Set1")
+  print(p)
+}
+
+for (i in 1:length(plot.var)) {
+ print(plot.var[i])
+  p<- FeatureStatPlot(raw.data, stat.by = plot.var[i], group.by = "Seq_Tube_ID",
+                      add_box = TRUE,palette = "Set1")
+  print(p)
+}
+dev.off()
+```
+
+# filter the cells
+
+```{r,filter the cell}
+filter.data<-subset(raw.data,
+                  subset=nGene > 1000 &
+                    nGene < 6000 &
+                    nCounts > 10000 &
+                    nCounts < 400000 &
+                   percent.ERCC> 5 &
+                   percent.ERCC< 90 &
+                   Complexity< 0.05 &
+                   Complexity> 0
+                    )
+
+```
+
+```{r,QC after cell filter,include=FALSE}
+plot.var<-colnames(filter.data@meta.data)[15:18]
+
+pdf(file = "QC/QC after cell filter-)-20231031.pdf",width = 8,height = 4)
+
+for (i in 1:length(plot.var)) {
+ print(plot.var[i])
+  p<- FeatureStatPlot(filter.data, stat.by = plot.var[i], group.by = "Group",
+                      add_box = TRUE,palette = "Set1")
+  print(p)
+}
+dev.off()
+```
+
+```{r}
+plot.var<-colnames(filter.data@meta.data)[15:18]
+
+pdf(file = "QC/QC after cell filter(plates)-20231031.pdf",width = 8,height = 4)
+
+for (i in 1:length(plot.var)) {
+ print(plot.var[i])
+  p<- FeatureStatPlot(filter.data, stat.by = plot.var[i], group.by = "Seq_Tube_ID",
+                      add_box = TRUE,palette = "Set1")
+  print(p)
+}
+dev.off()
+```
+
+
+```{r,save filtered data}
+save(filter.data,file = "filtered data-20231031.Rdata")
+```
+
+# Preprocessind and dimension reudction
+
+```{r,preprocess,include=FALSE}
+DefaultAssay(filter.data)<-"RNA"
+
+all.genes <- rownames(filter.data)
+
+filter.data <- FindVariableFeatures(filter.data, selection.method = "vst", nfeatures = 3000)
+filter.data<- ScaleData(filter.data,verbose = T,features =all.genes,
+                      vars.to.regress = c("nCounts","percent.ERCC"))
+
+```
+
+```{r, choose the first PCs,include=FALSE}
+DefaultAssay(filter.data)<-"RNA"
+filter.data<- RunPCA(filter.data, npcs = 30, verbose = FALSE)
+filter.data <- FindNeighbors(object = filter.data , dims = 1:30, verbose = FALSE)
+filter.data <- FindClusters(object = filter.data  , reduction.type = "pca", dims.use = 1:30, resolution = 0.1, print.output = FALSE) 
+
+pdf(file = "QC/Elbow and depthcor plot for RNA after QC-20231031.pdf")
+ElbowPlot(filter.data,ndims = 30,reduction = "pca")
+DepthCor(filter.data,n = 30,reduction = "pca")
+dev.off()
+```
+
+```{r,use the first 24 PCs,include=FALSE}
+filter.data <- FindNeighbors(object = filter.data , dims = 1:21, verbose = FALSE)
+filter.data <- FindClusters(object = filter.data  , reduction.type = "pca",
+                            dims.use = 1:21, 
+                            resolution = 0.1, 
+                            print.output = FALSE) 
+filter.data <- RunUMAP(filter.data ,reduction = "pca" ,dims = 1:21)
+filter.data <- RunTSNE(filter.data ,reduction = "pca" ,dims = 1:21)
+save(filter.data,file = "filtered data-20231031.Rdata")
+
+```
+
+```{r,vis with Dimplot,include=FALSE}
+pdf(file = "Dimplot for Group(umap)-20231031.pdf",height = 5,width = 6)
+CellDimPlot( filter.data,group.by ="Group",
+             label = T,
+            palette = "Set1",
+            reduction ="umap",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+dev.off()
+pdf(file = "Dimplot for Ploidy(umap)-20231031.pdf",height = 5,width = 6)
+CellDimPlot( filter.data,group.by ="Ploidy",
+             label = T,
+            palette = "Set2",
+            reduction ="umap",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+dev.off()
+pdf(file = "Dimplot for Age(umap)-20231031.pdf",height = 5,width = 6)
+CellDimPlot( filter.data,group.by ="Age",
+             label = T,
+            palette = "Dark2",
+            reduction ="umap",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+dev.off()
+pdf(file = "Dimplot for seurat_clusters(umap)-20231031.pdf",height = 5,width = 6)
+CellDimPlot( filter.data,group.by ="seurat_clusters",
+             label = T,
+            palette = "Paired",
+            reduction ="umap",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+dev.off()
+pdf(file = "Dimplot for Seq_Tube_ID(umap)-20231031.pdf",height = 5,width = 6)
+CellDimPlot( filter.data,group.by ="Seq_Tube_ID",
+             label = T,
+            palette = "Set3",
+            reduction ="umap",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+
+dev.off()
+
+pdf(file = "Dimplot for TSS ID(umap)-20231031.pdf",height = 5,width = 6)
+CellDimPlot( filter.data,group.by ="ID.Individual",
+             label = T,
+            palette = "Set3",
+            reduction ="umap",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+
+dev.off()
+
+pdf(file = "Dimplot for nGene(umap)-20231031.pdf",height = 5,width = 6)
+FeatureDimPlot(filter.data,features = "nGene",palette = "viridis", reduction ="umap",
+                theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+
+dev.off()
+
+pdf(file = "Dimplot for nCounts(umap)-20231031.pdf",height = 5,width = 6)
+FeatureDimPlot(filter.data,features = "nCounts",palette = "viridis", reduction ="umap",
+                theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+dev.off()
+
+pdf(file = "Dimplot for split Group(umap)-20231031.pdf",height = 9,width = 6)
+
+CellDimPlot( filter.data,group.by ="seurat_clusters",
+             label = T,
+             split.by = "Group",
+            palette =  "Paired",
+            reduction ="umap",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F,
+            nrow = 3,
+            ncol = 2)
+
+dev.off()
+
+```
+
+```{r,vis with Dimplot,include=FALSE}
+pdf(file = "Dimplot for Group(tsne)-20231031.pdf",height = 5,width = 6)
+CellDimPlot( filter.data,group.by ="Group",
+             label = T,
+            palette = "Set1",
+            reduction ="tsne",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+dev.off()
+pdf(file = "Dimplot for Ploidy(tsne)-20231031.pdf",height = 5,width = 6)
+CellDimPlot( filter.data,group.by ="Ploidy",
+             label = T,
+            palette = "Set2",
+            reduction ="tsne",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+dev.off()
+pdf(file = "Dimplot for Age(tsne)-20231031.pdf",height = 5,width = 6)
+CellDimPlot( filter.data,group.by ="Age",
+             label = T,
+            palette = "Dark2",
+            reduction ="tsne",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+dev.off()
+pdf(file = "Dimplot for seurat_clusters(tsne)-20231031.pdf",height = 5,width = 6)
+CellDimPlot( filter.data,group.by ="seurat_clusters",
+             label = T,
+            palette = "Paired",
+            reduction ="tsne",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+dev.off()
+pdf(file = "Dimplot for Seq_Tube_ID(tsne)-20231031.pdf",height = 5,width = 6)
+CellDimPlot( filter.data,group.by ="Seq_Tube_ID",
+             label = T,
+            palette = "Set3",
+            reduction ="tsne",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+
+dev.off()
+
+
+pdf(file = "Dimplot for TSS ID(tsne)-20231031.pdf",height = 5,width = 6)
+CellDimPlot( filter.data,group.by ="ID.Individual",
+             label = T,
+            palette = "Set3",
+            reduction ="tsne",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+
+dev.off()
+
+
+pdf(file = "Dimplot for nGene(tsne)-20231031.pdf",height = 5,width = 6)
+FeatureDimPlot(filter.data,features = "nGene",palette = "viridis", reduction ="tsne",
+                theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+
+dev.off()
+
+pdf(file = "Dimplot for nCounts(tsne)-20231031.pdf",height = 5,width = 6)
+FeatureDimPlot(filter.data,features = "nCounts",palette = "viridis", reduction ="tsne",
+                theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F)
+dev.off()
+
+pdf(file = "Dimplot for split Group(tsne)-20231031.pdf",height = 9,width = 6)
+
+CellDimPlot( filter.data,group.by ="seurat_clusters",
+             label = T,
+             split.by = "Group",
+            palette =  "Paired",
+            reduction ="tsne",
+            theme_use = "theme_blank",
+            pt.size =1.5,
+            raster = F,
+            nrow = 3,
+            ncol = 2)
+
+dev.off()
+
+
+```
+
+
+# correlation between plodiy
+```{r}
+filter.data<-SetIdent(filter.data,value = "Age")
+
+filter.data <- NormalizeData(filter.data,normalization.method = "LogNormalize", scale.factor = 10000)
+
+Y.data<-subset(filter.data,idents="Young")
+
+O.data<-subset(filter.data,idents="Old")
+```
+
+```{r,correlation for both Y and O,include=FALSE}
+pdf("correlation/correlation between ploidy in Y and O-20231031.pdf",width = 8,height = 6)
+# Pearson cor
+p<-CellCorHeatmap(filter.data,
+                  srt_ref =filter.data,
+                
+                  query_collapsing =T,
+                  query_group_palette="Set2",
+                  ref_group_palette="Set2",
+                  query_group="Ploidy",
+                  ref_group="Ploidy",
+                  ref_collapsing = T,
+                  nfeatures=2000,
+                  heatmap_palette= "Purples",
+                  distance_metric="pearson",
+                  cluster_rows = T,
+                  #limits=c(0.979,0.985),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Pearson Correlation between Ploidy(Y+O)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p)
+
+
+
+#  jaccard cor
+p<-CellCorHeatmap(filter.data,
+                  srt_ref =filter.data,
+                  query_collapsing =T,
+                  query_group_palette="Set2",
+                  ref_group_palette="Set2",
+                  query_group="Ploidy",
+                  ref_group="Ploidy",
+                  ref_collapsing = T,
+                  nfeatures=2000,
+                  heatmap_palette= "Greens",
+                  distance_metric="jaccard",
+                  cluster_rows = T,
+               #   limits=c(0.968,0.970),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Jaccard Correlation between Ploidy(Y+O)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p) 
+# cosine similarity
+p<-CellCorHeatmap(filter.data,
+                  srt_ref =filter.data,
+                  query_collapsing =T,
+                  query_group_palette="Set2",
+                  ref_group_palette="Set2",
+                  query_group="Ploidy",
+                  ref_group="Ploidy",
+                  ref_collapsing = T,
+                  nfeatures=2000,
+                  heatmap_palette= "OrRd",
+                  distance_metric="cosine",
+                  cluster_rows = T,
+                
+              #limits=c(0.981,1),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Cosine similarity between Ploidy(Y+O)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p)
+
+dev.off()
+```
+
+```{r,correlation for Y ,include=FALSE}
+pdf("correlation/correlation between ploidy in Y-20231031.pdf",width = 8,height = 6)
+# Pearson cor
+p<-CellCorHeatmap(Y.data,
+                  srt_ref =Y.data,
+                  query_collapsing =T,
+                  query_group_palette="Set2",
+                  ref_group_palette="Set2",
+                  query_group="Ploidy",
+                  ref_group="Ploidy",
+                  ref_collapsing = T,
+                  nfeatures=3000,
+                  heatmap_palette= "Purples",
+                  distance_metric="pearson",
+                  cluster_rows = T,
+                 # limits=c(0.979,0.985),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Pearson Correlation between Ploidy(Young)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p)
+
+
+
+#  jaccard cor
+p<-CellCorHeatmap(Y.data,
+                  srt_ref =Y.data,
+                  query_collapsing =T,
+                  query_group_palette="Set2",
+                  ref_group_palette="Set2",
+                  query_group="Ploidy",
+                  ref_group="Ploidy",
+                  ref_collapsing = T,
+                  nfeatures=3000,
+                  heatmap_palette= "Greens",
+                  distance_metric="jaccard",
+                  cluster_rows = T,
+                 limits=c(0.94,0.96),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Jaccard Correlation between Ploidy(Young)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p) 
+# cosine similarity
+p<-CellCorHeatmap(Y.data,
+                  srt_ref =Y.data,
+                  query_collapsing =T,
+                  query_group_palette="Set2",
+                  ref_group_palette="Set2",
+                  query_group="Ploidy",
+                  ref_group="Ploidy",
+                  ref_collapsing = T,
+                  nfeatures=3000,
+                  heatmap_palette= "OrRd",
+                  distance_metric="cosine",
+                  cluster_rows = T,
+                 # limits=c(0.981,1),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Cosine similarity between Ploidy(Young)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p)
+
+dev.off()
+```
+
+```{r}
+pdf("jaccard between ploidy in Y-20231031.pdf",width = 8,height = 6)
+p<-CellCorHeatmap(Y.data,
+                  srt_ref =Y.data,
+                  query_collapsing =T,
+                  query_group_palette="Set2",
+                  ref_group_palette="Set2",
+                  query_group="Ploidy",
+                  ref_group="Ploidy",
+                  ref_collapsing = T,
+                  nfeatures=3000,
+                  heatmap_palette= "Greens",
+                  distance_metric="jaccard",
+                  cluster_rows = T,
+                 limits=c(0.94,0.96),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Jaccard Correlation between Ploidy(Young)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p) 
+
+dev.off()
+```
+
+
+```{r,correlation for O ,include=FALSE}
+pdf("correlation/correlation between ploidy in O-20231031.pdf",width = 8,height = 6)
+# Pearson cor
+p<-CellCorHeatmap(O.data,
+                  srt_ref =O.data,
+                  query_collapsing =T,
+                  query_group_palette="Set2",
+                  ref_group_palette="Set2",
+                  query_group="Ploidy",
+                  ref_group="Ploidy",
+                  ref_collapsing = T,
+                  nfeatures=3000,
+                  heatmap_palette= "Purples",
+                  distance_metric="pearson",
+                  cluster_rows = T,
+                 # limits=c(0.979,0.985),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Pearson Correlation between Ploidy(Old)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p)
+
+
+
+#  jaccard cor
+p<-CellCorHeatmap(O.data,
+                  srt_ref =O.data,
+                  query_collapsing =T,
+                  query_group_palette="Set2",
+                  ref_group_palette="Set2",
+                  query_group="Ploidy",
+                  ref_group="Ploidy",
+                  ref_collapsing = T,
+                  nfeatures=3000,
+                  heatmap_palette= "Greens",
+                  distance_metric="jaccard",
+                  cluster_rows = T,
+                 #limits=c(0.93,0.94),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Jaccard Correlation between Ploidy(Old)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p) 
+# cosine similarity
+p<-CellCorHeatmap(O.data,
+                  srt_ref =O.data,
+                  query_collapsing =T,
+                  query_group_palette="Set2",
+                  ref_group_palette="Set2",
+                  query_group="Ploidy",
+                  ref_group="Ploidy",
+                  ref_collapsing = T,
+                  nfeatures=3000,
+                  heatmap_palette= "OrRd",
+                  distance_metric="cosine",
+                  cluster_rows = T,
+                 # limits=c(0.981,1),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Cosine similarity between Ploidy(Old)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p)
+
+dev.off()
+```
+
+```{r}
+pdf("jaccard between ploidy in O-20231031.pdf",width = 8,height = 6)
+p<-CellCorHeatmap(O.data,
+                  srt_ref =O.data,
+                  query_collapsing =T,
+                  query_group_palette="Set2",
+                  ref_group_palette="Set2",
+                  query_group="Ploidy",
+                  ref_group="Ploidy",
+                  ref_collapsing = T,
+                  nfeatures=3000,
+                  heatmap_palette= "Greens",
+                  distance_metric="jaccard",
+                  cluster_rows = T,
+                 #limits=c(0.93,0.94),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Jaccard Correlation between Ploidy(Old)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p)
+dev.off()
+```
+
+
+```{r,correlation between groups,include=FALSE}
+pdf("correlation/correlation between Group-20231031.pdf",width = 8,height = 6)
+# Pearson cor
+p<-CellCorHeatmap(filter.data,
+                  srt_ref =filter.data,
+                  query_collapsing =T,
+                  query_group_palette="Set1",
+                  ref_group_palette="Set1",
+                  query_group="Group",
+                  ref_group="Group",
+                  ref_collapsing = T,
+                  nfeatures=3000,
+                  heatmap_palette= "Purples",
+                  distance_metric="pearson",
+                  cluster_rows = T,
+                 # limits=c(0.979,0.985),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Pearson Correlation between Group") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p)
+
+
+
+#  jaccard cor
+p<-CellCorHeatmap(filter.data,
+                  srt_ref =filter.data,
+                  query_collapsing =T,
+                  query_group_palette="Set1",
+                  ref_group_palette="Set1",
+                  query_group="Group",
+                  ref_group="Group",
+                  ref_collapsing = T,
+                  nfeatures=3000,
+                  heatmap_palette= "Greens",
+                  distance_metric="jaccard",
+                  cluster_rows = T,
+                limits=c(0.93,0.935),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Jaccard Correlation between Group") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p) 
+
+
+p<-CellCorHeatmap(filter.data,
+                  srt_ref =filter.data,
+                  query_collapsing =T,
+                  query_group_palette="Set1",
+                  ref_group_palette="Set1",
+                  query_group="Group",
+                  ref_group="Group",
+                  ref_collapsing = T,
+                  nfeatures=3000,
+                  heatmap_palette= "OrRd",
+                  distance_metric="cosine",
+                  cluster_rows = T,
+                 #limits=c(0.981,1),
+                  cluster_columns =T,
+                  height = 4,
+                  width = 5
+                  )$plot+
+  ggtitle("Cosine similarity between Group") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p)
+dev.off()
+```
+
+# check ke genes by Violin plot
+
+```{r,load the gene to be checked}
+gene.to.check<-read.csv(file = "gene to be plotted.csv",header = F)
+gene.to.check<-as.vector(gene.to.check$V1)
+```
+
+```{r}
+pdf("heatmap/ Violin plot grouped by ploidy(Y and O)-20231031.pdf",height = 20,width = 5)
+FeatureStatPlot(filter.data, 
+                slot = "counts",
+                stat.by = gene.to.check, 
+                group.by = "Ploidy",
+                palette ="Set2",
+                y.min = 0,
+                y.max =2,
+                add_box = TRUE, stack = TRUE)
+dev.off()
+```
+
+```{r}
+pdf("heatmap/ heatmap grouped by ploidy(Y and O)-20231031.pdf",height = 11,width = 11)
+GroupHeatmap(filter.data,
+  features = gene.to.check,
+   exp_method = "zscore",
+  libsize = 1000000,
+  group.by = "Ploidy",
+  cluster_rows = T,
+  cluster_columns = T,
+  show_row_names =T,
+  group_palette = "Set2",
+ height = 9,
+ width =7
+)$plot+
+  ggtitle("Heatmap for key genes (Y+O)") +
+  theme(plot.title = element_text(hjust = 0.4))
+dev.off()
+
+
+pdf("heatmap/ heatmap grouped by ploidy(Y)-20231031.pdf",height = 11,width = 11)
+GroupHeatmap(Y.data,
+  features = gene.to.check,
+   exp_method = "zscore",
+  libsize = 1000000,
+  group.by = "Ploidy",
+  cluster_rows = T,
+  cluster_columns = T,
+  show_row_names =T,
+  group_palette = "Set2",
+ height = 9,
+ width =7
+)$plot+
+  ggtitle("Heatmap for key genes (Young)") +
+  theme(plot.title = element_text(hjust = 0.4))
+dev.off()
+
+
+pdf("heatmap/ heatmap grouped by ploidy(O)-20231031.pdf",height = 11,width = 11)
+GroupHeatmap(O.data,
+  features = gene.to.check,
+   exp_method = "zscore",
+  libsize = 1000000,
+  group.by = "Ploidy",
+  cluster_rows = T,
+  cluster_columns = T,
+  show_row_names =T,
+  group_palette = "Set2",
+ height = 9,
+ width =7
+)$plot+
+  ggtitle("Heatmap for key genes (Old)") +
+  theme(plot.title = element_text(hjust = 0.4))
+dev.off()
+
+pdf("heatmap/ heatmap grouped by Group-20231031.pdf",height = 11,width = 11)
+GroupHeatmap(filter.data,
+  features = gene.to.check,
+   exp_method = "zscore",
+  libsize = 1000000,
+  group.by = "Group",
+  cluster_rows = T,
+  cluster_columns = T,
+  show_row_names =T,
+  group_palette = "Set1",
+  heatmap_palette = "PRGn",
+ height = 9,
+ width =7
+)$plot+
+  ggtitle("Heatmap for key genes (Y+O)") +
+  theme(plot.title = element_text(hjust = 0.4))
+dev.off()
+```

@@ -1,0 +1,395 @@
+---
+title: "Analysis for Methylation BeadsChip"
+output: html_notebook
+---
+
+# system setting
+
+```{r,library,include=FALSE}
+library(sesame)
+library(ggplot2)
+library(pals)
+library(FactoMineR)
+library(factoextra) 
+library(FactoInvestigate)
+library(future)
+library(future.apply)
+library(RColorBrewer)
+library(SummarizedExperiment)
+library(ggpubr)
+library(ggpmisc)
+nbrOfWorkers()
+plan(multisession, workers=16)
+nbrOfWorkers()
+tools::R_user_dir("ExperimentHub", which="cache")
+```
+
+```{r,set path}
+setwd("user/path")
+```
+
+
+#QC
+
+```{r,load the data and make a list,include=FALSE}
+sample.info<-read.csv(file ="M01150_summary.csv",header = T)
+
+idat_dir<-"BeadsChip/"
+sdfs = openSesame(idat_dir, func = NULL,
+                 prep = "TQCDPB",
+                  BPPARAM = BiocParallel::SnowParam(6),)
+
+names(sdfs)<-sample.info$Sample.ID[match(names(sdfs), sample.info$Sample.Group)]
+```
+
+```{r,QC per sample,include=FALSE}
+p1<-sesameQC_plotBar(lapply(sdfs, sesameQC_calcStats, "detection"))
+p2<-sesameQC_plotBar(lapply(sdfs, sesameQC_calcStats, "intensity"))
+
+pdf(file = "sucessful detection and sig intensity.pdf",width = 8)
+print(p1)
+print(p2)
+dev.off()
+
+pdf(file = "QQ plot for each samples.pdf")
+for (i in 1:length(sdfs)) {
+  p<-sesameQC_plotRedGrnQQ(sdfs[[i]],main=paste0(names(sdfs)[i]," R-G QQ Plot"))
+  print(p)
+}
+dev.off()
+
+pdf(file = "Intensity-beta plot for each samples.pdf")
+for (i in 1:length(sdfs)) {
+  p<-sesameQC_plotIntensVsBetas(sdfs[[i]],main=paste0(names(sdfs)[i]," Intensity-beta plot"))
+  print(p)
+}
+dev.off()
+```
+
+
+
+# PCA
+
+```{r,load the data}
+sample.info<-read.csv(file ="M01150_summary.csv",header = T)
+
+idat_dir<-"BeadsChip/"
+sdfs = openSesame(idat_dir, func = NULL,
+                 prep = "TQCDPB",
+                  BPPARAM = BiocParallel::SnowParam(6),)
+
+
+betas = do.call(cbind, BiocParallel::bplapply(
+    searchIDATprefixes(idat_dir), function(pfx) {
+        getBetas(noob(pOOBAH(dyeBiasNL(inferInfiniumIChannel(qualityMask(
+            readIDATpair(pfx)))))), mask=FALSE)
+}, BPPARAM = BiocParallel::SnowParam(6)))
+
+
+
+colnames(betas)<-sample.info$Sample.ID[match(colnames(betas), sample.info$Sample.Group)]
+
+names(sdfs)<-sample.info$Sample.ID[match(names(sdfs), sample.info$Sample.Group)]
+```
+
+```{r,make a metadata}
+ag.info<-read.csv(file = "Age and group.csv",header = T)
+rownames(ag.info)<-ag.info$SNI
+ag.info<-ag.info[-which(ag.info$Strain=="CTCF MID"),]
+ag.info$age.group<-ifelse(grepl("young",ag.info$Strain),"Young","Old")
+ag.info$genotype<-1
+ag.info$genotype[grepl("WT",ag.info$Strain)]<-"WT"
+ag.info$genotype[grepl("HNF4",ag.info$Strain)]<-"HNF4_KO"
+ag.info$genotype[grepl("CeBPa",ag.info$Strain)]<-"CeBPa_KO"
+ag.info$genotype[grepl("CTCF",ag.info$Strain)]<-"CTCF_KO"
+
+```
+
+```{r,filter and make df}
+betas<-as.data.frame(t(betas))
+
+ncol(betas)
+
+betas$Strain<-ag.info$Strain[match(rownames(betas),rownames(ag.info))]
+  
+ncol(betas)
+
+betas<-betas[-which(rownames(betas)=="SNI-283"),]
+
+betas$age.group<-ag.info$age.group[match(rownames(betas),rownames(ag.info))]
+
+betas$genotype<-ag.info$genotype[match(rownames(betas),rownames(ag.info))]
+```
+
+```{r,calculate the PCA}
+res.pca <- PCA(betas[,c(1:296070)], 
+               scale.unit = TRUE, 
+               ncp=5,
+               graph = F)
+```
+
+```{r,check the contribution of each PCs}
+fviz_eig(res.pca, addlabels = TRUE, ylim = c(0, 50))
+```
+
+```{r,PCA plot, include=FALSE}
+pdf(file = "PcA.pdf")   
+
+fviz_pca_ind(res.pca,
+              geom.ind = "point", 
+              col.ind = as.factor(betas$Strain), 
+             pointshape= 16,
+             pointsize=2,
+             mean.point =F,
+              palette = brewer.pal(8,"Paired"),
+              addEllipses = TRUE, # Concentration ellipses 
+             legend.title = "Groups" ,
+           
+             ellipse.level = 0.3
+              )
+
+fviz_pca_ind(res.pca,
+              geom.ind = "point", 
+              col.ind = betas$age.group, 
+             pointshape= 16,
+             pointsize=2,
+             mean.point =F,
+              palette = brewer.pal(2,"Dark2"),
+              addEllipses = TRUE, # Concentration ellipses 
+             legend.title = "Groups" ,
+            
+             ellipse.level = 0.6
+              )
+
+
+fviz_pca_ind(res.pca,
+              geom.ind = "point", 
+              col.ind = betas$genotype, 
+             pointshape= 16,
+             pointsize=2,
+             mean.point =F,
+              palette = brewer.pal(4,"Set1"),
+              addEllipses = TRUE, # Concentration ellipses 
+             legend.title = "Groups" ,
+            
+             ellipse.level = 0.3
+              )
+                   
+
+dev.off()
+```
+
+
+# Aging predictor
+
+```{r,extract the beta matrix with NA}
+beta.pre = do.call(cbind, BiocParallel::bplapply(
+    searchIDATprefixes(idat_dir), function(pfx) {
+        getBetas(noob(pOOBAH(dyeBiasNL(inferInfiniumIChannel(qualityMask(
+            readIDATpair(pfx)))))), mask=T,collapseToPfx = F)
+}, BPPARAM = BiocParallel::SnowParam(6)))
+```
+
+```{r,filter and make a df}
+colnames(beta.pre)<-sample.info$Sample.ID[match(colnames(beta.pre), sample.info$Sample.Group)]
+beta.pre<-as.data.frame(t(beta.pre))
+beta.pre<-beta.pre[-which(rownames(beta.pre)=="SNI-283"),]
+beta.pre<-as.data.frame(t(beta.pre))
+```
+
+```{r,prediction,include=FALSE}
+pre.age.dat<-vector()
+
+for (i in 1:ncol(beta.pre)) {
+  sample.ID<-colnames(beta.pre)[i]
+  
+  beta.vector<-beta.pre[,i]
+  
+  names(beta.vector)<-rownames(beta.pre)
+  
+  pred.age<-predictMouseAgeInMonth(beta.vector)
+  
+  pre.age.dat[i]<-pred.age
+  
+  names(pre.age.dat)[i]<-sample.ID
+  
+}
+
+pre.age.dat<-data.frame(sample.ID=names(pre.age.dat),
+                        predict.Age=pre.age.dat)
+
+```
+
+```{r,merge the data}
+colnames(ag.info)[3]<-"Chronological.Age"
+colnames(pre.age.dat)[2]<-"Predicted.Age"
+
+merge.dat<-merge(x = ag.info,y = pre.age.dat,by.x="SNI",by.y="sample.ID")
+write.csv(merge.dat,file = "Methylation prediction results.csv",row.names = F)
+```
+
+```{r,lm plot}
+library(ggplot2)
+library(dplyr)
+
+# Define a color mapping for genotypes
+genotype_colors <- setNames(brewer.pal(4,"Set1"), unique(merge.dat$genotype))
+
+# Fit linear models for each genotype and extract required info
+model_info <- merge.dat %>%
+  group_by(genotype) %>%
+  do({
+    model <- lm(Predicted.Age ~ Chronological.Age, data = .)
+    data.frame(
+      genotype = unique(.$genotype),
+      eq = paste("y =",
+                 format(coef(model)[1], digits = 2),
+                 "+",
+                 format(coef(model)[2], digits = 2), "x"),
+      r.squared = summary(model)$r.squared
+    )
+  }) %>%
+  ungroup()
+
+# Create the scatter plot
+p <- ggscatter(
+  merge.dat, 
+  x = "Chronological.Age", 
+  y = "Predicted.Age",
+ color = "genotype", 
+ palette = genotype_colors ,
+  add = "reg.line"
+)
+
+# Manually set positions for annotations
+# Adjust these positions based on your plot
+annotations <- data.frame(
+  x = c(10, 10,10, 10),  # X-positions for each genotype
+  y = c(13, 14, 15,16),  # Y-positions for each genotype
+  hjust = c(1, 1, 1,1),   # Horizontal adjustments
+  vjust = c(1, 1, 1, 1),   # Vertical adjustments
+  genotype = unique(merge.dat$genotype)
+)
+
+# Annotate the plot with the equations and R^2 values
+for(i in 1:nrow(model_info)) {
+  ann <- annotations[annotations$genotype == model_info$genotype[i], ]
+  p <- p + annotate(
+    "text", 
+    x = ann$x, 
+    y = ann$y,
+    label = paste(model_info$eq[i], ", R² =", round(model_info$r.squared[i], 2)),
+    hjust = ann$hjust, 
+    vjust = ann$vjust,
+    color = genotype_colors[model_info$genotype[i]]  # Use the predefined genotype colors
+  )
+}
+
+# Print the plot
+p<-p+theme_minimal()+xlab("Chronological Age (months)")+ylab("Predicted Age (months)")
+
+p
+
+ggsave(filename = "lm regression plot.pdf",dpi = 300)
+```
+
+```{r,revise}
+merge.dat<-merge.dat[-which(merge.dat$SNI=="SNI-325"),]
+
+library(ggplot2)
+library(dplyr)
+library(ggpubr)
+library(RColorBrewer)
+# Define a color mapping for genotypes
+genotype_colors <- setNames(brewer.pal(4,"Set1"), unique(merge.dat$genotype))
+
+# Fit linear models for each genotype and extract required info
+model_info <- merge.dat %>%
+  group_by(genotype) %>%
+  do({
+    model <- lm(Predicted.Age ~ Chronological.Age, data = .)
+    data.frame(
+      genotype = unique(.$genotype),
+      eq = paste("y =",
+                 format(coef(model)[1], digits = 2),
+                 "+",
+                 format(coef(model)[2], digits = 2), "x"),
+      r.squared = summary(model)$r.squared
+    )
+  }) %>%
+  ungroup()
+
+# Create the scatter plot
+p <- ggscatter(
+  merge.dat, 
+  x = "Chronological.Age", 
+  y = "Predicted.Age",
+ color = "genotype", 
+ palette = genotype_colors ,
+  add = "reg.line"
+)+xlim(0,25)+ylim(0,20)
+
+# Manually set positions for annotations
+# Adjust these positions based on your plot
+annotations <- data.frame(
+  x = c(10, 10,10, 10),  # X-positions for each genotype
+  y = c(13, 14, 15,16),  # Y-positions for each genotype
+  hjust = c(1, 1, 1,1),   # Horizontal adjustments
+  vjust = c(1, 1, 1, 1),   # Vertical adjustments
+  genotype = unique(merge.dat$genotype)
+)
+
+# Annotate the plot with the equations and R^2 values
+for(i in 1:nrow(model_info)) {
+  ann <- annotations[annotations$genotype == model_info$genotype[i], ]
+  p <- p + annotate(
+    "text", 
+    x = ann$x, 
+    y = ann$y,
+    label = paste(model_info$eq[i], ", R² =", round(model_info$r.squared[i], 2)),
+    hjust = ann$hjust, 
+    vjust = ann$vjust,
+    color = genotype_colors[model_info$genotype[i]]  # Use the predefined genotype colors
+  )
+}
+
+# Print the plot
+p<-p+theme_minimal()+xlab("Chronological Age (months)")+ylab("Predicted Age (months)")
+
+p
+
+ggsave(filename = "lm regression plot.pdf",dpi = 300)
+
+```
+
+```{r}
+plot.df<-data.frame(
+  age=c(merge.dat$Chronological.Age,merge.dat$Predicted.Age),
+  group=c(merge.dat$age.group,merge.dat$age.group),
+  genotype=c(merge.dat$genotype,merge.dat$genotype),
+  pred=c(rep("Chronological.Age",length(merge.dat$Chronological.Age)),
+         rep("Predicted.Age",length(merge.dat$Predicted.Age))
+             )
+  
+)
+
+plot.df$group<-factor(plot.df$group,levels = c("Young","Old"))
+
+
+```
+
+```{r}
+ggboxplot(plot.df, 
+          x="genotype",
+          y="age",
+          color = "pred",
+        #  fill = "pred",
+          palette = brewer.pal(4,"Set1"),
+          add="jitter", 
+          facet.by ="group"
+          
+          )
+ggsave(filename = "barplots.pdf",width = 12,height = 5)
+
+```
+
